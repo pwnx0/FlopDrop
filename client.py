@@ -46,6 +46,13 @@ class FlopAuthError(FlopGatewayError):
     pass
 
 
+class FlopNodeOverloadedError(FlopGatewayError):
+    """Raised on HTTP 502/504 or timeouts when FLOP GPU inference nodes are busy or restarting."""
+    def __init__(self, message: str, retry_after: Optional[float] = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class FlopGatewayClient:
     """Official client for FLOP Public Inference Data Plane."""
 
@@ -199,19 +206,32 @@ class FlopGatewayClient:
         if temperature is not None:
             payload["temperature"] = temperature
 
-        with httpx.Client(timeout=self.timeout) as client:
-            resp = client.post(url, json=payload, headers=headers)
-            if resp.status_code == 401:
-                raise FlopAuthError(f"Gateway rejected bearer token (401): {resp.text}")
-            if resp.status_code == 429:
-                retry_after = None
-                try:
-                    retry_after = float(resp.headers.get("Retry-After", "30"))
-                except (ValueError, TypeError):
-                    retry_after = 30.0
-                raise FlopRateLimitError(f"Gateway rate limited (429): {resp.text}", retry_after=retry_after)
-            resp.raise_for_status()
-            return resp.json()
+        # Inference on decentralized GPU nodes needs a higher timeout (60s)
+        inference_timeout = max(self.timeout, 60.0)
+        try:
+            with httpx.Client(timeout=inference_timeout) as client:
+                resp = client.post(url, json=payload, headers=headers)
+                if resp.status_code == 401:
+                    raise FlopAuthError(f"Gateway rejected bearer token (401): {resp.text}")
+                if resp.status_code == 429:
+                    retry_after = None
+                    try:
+                        retry_after = float(resp.headers.get("Retry-After", "30"))
+                    except (ValueError, TypeError):
+                        retry_after = 30.0
+                    raise FlopRateLimitError(f"Gateway rate limited (429): {resp.text}", retry_after=retry_after)
+                if resp.status_code in (502, 503, 504):
+                    raise FlopNodeOverloadedError(
+                        f"FLOP GPU inference node busy/recovering (HTTP {resp.status_code})",
+                        retry_after=45.0,
+                    )
+                resp.raise_for_status()
+                return resp.json()
+        except httpx.TimeoutException as exc:
+            raise FlopNodeOverloadedError(
+                f"FLOP GPU inference timed out after {inference_timeout:.0f}s (node queue busy).",
+                retry_after=30.0,
+            ) from exc
 
     def claim_faucet(self, address: str) -> Dict[str, Any]:
         """Direct faucet request to fund devnet/testnet wallet."""

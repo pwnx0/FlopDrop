@@ -24,6 +24,7 @@ from client import (
     FlopAuthError,
     FlopCapReachedError,
     FlopGatewayClient,
+    FlopNodeOverloadedError,
     FlopRateLimitError,
 )
 from config import BotConfig
@@ -66,6 +67,9 @@ class FlopCommunityBot:
 
         self._bearer_token: Optional[str] = None
         self._cooldown_until: float = 0.0
+        self._cached_balance: Optional[Decimal] = None
+        self._last_balance_check: float = 0.0
+        self._last_faucet_attempt: float = 0.0
 
     def _init_db(self) -> None:
         """Initialize local SQLite ledger for completed execution receipts."""
@@ -179,29 +183,44 @@ class FlopCommunityBot:
             time.sleep(min(wait_s, 5.0))
             return False
 
-        # 1. Verify balance threshold & Auto-claim faucet if needed
-        bal = self.rpc.get_wallet_balance(self.address)
-        if bal is None or bal < Decimal(str(self.config.min_required_balance_flop)):
-            current_bal = bal if bal is not None else Decimal("0.0")
-            logger.info(
-                "Wallet balance (%s FLOP) is below required minimum (%s FLOP). Auto-requesting faucet funding...",
-                current_bal, self.config.min_required_balance_flop
-            )
-            try:
-                claim_res = self.gateway.claim_faucet(self.address)
-                logger.info("Faucet claim response: %s", claim_res)
-                # Wait briefly for on-chain indexing
-                time.sleep(5.0)
-                bal = self.rpc.get_wallet_balance(self.address)
-            except Exception as f_err:
-                logger.warning("Auto-faucet claim failed or cooldown active: %s", f_err)
+        # 1. Cached Balance Verification & Rate-Limited Auto-Faucet
+        # Only query explorer if never checked or after 10 minutes (600s) to prevent 429 spam
+        if self._cached_balance is None or (now - self._last_balance_check > 600.0):
+            fetched_bal = self.rpc.get_wallet_balance(self.address)
+            self._last_balance_check = now
+            if fetched_bal is not None:
+                self._cached_balance = fetched_bal
+                logger.info("On-chain wallet balance: %0.4f FLOP", fetched_bal)
+            elif self._cached_balance is None:
+                # If explorer is rate-limited on startup, assume sufficient balance so we don't spam faucet
+                logger.debug("Explorer balance check rate limited or unavailable, continuing with cached session.")
 
-        if bal is not None and bal < Decimal(str(self.config.min_required_balance_flop)):
-            logger.warning(
-                "Balance still below minimum (%s FLOP). Please ensure account has devnet/testnet tokens.",
-                self.config.min_required_balance_flop
-            )
-            return False
+        # If balance was confirmed to be below minimum, trigger faucet with strict 1-hour cooldown
+        min_bal = Decimal(str(self.config.min_required_balance_flop))
+        if self._cached_balance is not None and self._cached_balance < min_bal:
+            if now - self._last_faucet_attempt > 3600.0:
+                logger.info(
+                    "Wallet balance (%0.4f FLOP) is below required minimum (%s FLOP). Requesting faucet...",
+                    self._cached_balance, self.config.min_required_balance_flop
+                )
+                self._last_faucet_attempt = now
+                try:
+                    claim_res = self.gateway.claim_faucet(self.address)
+                    logger.info("Faucet claim response: %s", claim_res)
+                    time.sleep(5.0)
+                    new_bal = self.rpc.get_wallet_balance(self.address)
+                    if new_bal is not None:
+                        self._cached_balance = new_bal
+                except Exception as f_err:
+                    logger.warning("Auto-faucet claim failed or cooldown active: %s", f_err)
+
+            if self._cached_balance < min_bal:
+                logger.warning(
+                    "Balance still below minimum (%s FLOP). Waiting for funding before running inference.",
+                    self.config.min_required_balance_flop
+                )
+                self._cooldown_until = time.time() + 60.0
+                return False
 
         # 2. Ensure gateway enrollment
         try:
@@ -238,8 +257,14 @@ class FlopCommunityBot:
             self._cooldown_until = time.time() + backoff_s
             logger.warning("FLOP Gateway rate limited (429). Backing off for %0.1fs", backoff_s)
             return False
+        except FlopNodeOverloadedError as exc:
+            backoff_s = exc.retry_after or 45.0
+            self._cooldown_until = time.time() + backoff_s
+            logger.warning("FLOP GPU inference node busy/recovering (%s). Backing off for %0.1fs...", exc, backoff_s)
+            return False
         except Exception as exc:
             logger.error("Inference execution failed: %s", exc)
+            self._cooldown_until = time.time() + 30.0
             return False
 
         latency = (time.perf_counter() - start_ts) * 1000.0
